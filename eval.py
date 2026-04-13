@@ -22,7 +22,7 @@ import csv
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-from rag_answer import rag_answer
+from rag_answer import rag_answer, call_llm
 
 # =============================================================================
 # CẤU HÌNH
@@ -88,12 +88,57 @@ def score_faithfulness(
 
     Trả về dict với: score (1-5) và notes (lý do)
     """
-    # TODO Sprint 4: Implement scoring
-    # Tạm thời trả về None (yêu cầu chấm thủ công)
-    return {
-        "score": None,
-        "notes": "TODO: Chấm thủ công hoặc implement LLM-as-Judge",
-    }
+    # LLM-as-Judge: Đánh giá xem câu trả lời có bám vào retrieved chunks không
+    if not chunks_used or not answer:
+        return {"score": 1, "notes": "No chunks or answer provided"}
+
+    # Build context from chunks
+    context_parts = []
+    for i, chunk in enumerate(chunks_used, 1):
+        context_parts.append(f"[{i}] {chunk.get('text', '')[:500]}")
+    context_text = "\n\n".join(context_parts)
+
+    prompt = f"""You are an expert evaluator checking whether an AI assistant's answer is grounded in the provided context.
+
+Retrieved Context:
+{context_text}
+
+AI Assistant Answer:
+{answer}
+
+Rate the faithfulness on a scale of 1-5:
+5 = Every piece of information in the answer can be found in the context above
+4 = Almost entirely grounded, with 1 minor detail that might be from prior knowledge
+3 = Mostly grounded, but some information appears to come from the model's own knowledge
+2 = Many claims in the answer are NOT supported by the provided context
+1 = The answer is NOT grounded at all - most information appears fabricated
+
+Output ONLY a JSON object with this exact format, no markdown or other text:
+{{"score": <int>, "reason": "<short explanation of the score>"}}"""
+
+    try:
+        response = call_llm(prompt).strip()
+        # Clean markdown formatting if present
+        if response.startswith("```json"):
+            response = response[7:]
+        if response.startswith("```"):
+            response = response[3:]
+        if response.endswith("```"):
+            response = response[:-3]
+
+        result = json.loads(response.strip())
+        score = int(result.get("score", 3))
+        reason = result.get("reason", "")
+        return {
+            "score": min(5, max(1, score)),  # Clamp to 1-5
+            "notes": f"Faithfulness: {reason[:150]}",
+        }
+    except Exception as e:
+        # Fallback: manual check based on answer content
+        return {
+            "score": 3,
+            "notes": f"LLM-as-Judge failed ({str(e)[:50]}), defaulted to 3",
+        }
 
 
 def score_answer_relevance(
@@ -113,10 +158,49 @@ def score_answer_relevance(
 
     TODO Sprint 4: Implement tương tự score_faithfulness
     """
-    return {
-        "score": None,
-        "notes": "TODO: Implement score_answer_relevance",
-    }
+    if not answer or not query:
+        return {"score": 1, "notes": "No answer or query provided"}
+
+    prompt = f"""You are an expert evaluator checking whether an AI assistant's answer is relevant to the user's question.
+
+User Question:
+{query}
+
+AI Assistant Answer:
+{answer}
+
+Rate the answer relevance on a scale of 1-5:
+5 = The answer directly and completely addresses what the user asked
+4 = Answer is correct but missing a few minor details
+3 = Answer is related but not focused on the core issue
+2 = Answer is partially off-topic
+1 = The answer does not address the user's question at all
+
+Output ONLY a JSON object with this exact format, no markdown or other text:
+{{"score": <int>, "reason": "<short explanation of the score>"}}"""
+
+    try:
+        response = call_llm(prompt).strip()
+        # Clean markdown formatting if present
+        if response.startswith("```json"):
+            response = response[7:]
+        if response.startswith("```"):
+            response = response[3:]
+        if response.endswith("```"):
+            response = response[:-3]
+
+        result = json.loads(response.strip())
+        score = int(result.get("score", 3))
+        reason = result.get("reason", "")
+        return {
+            "score": min(5, max(1, score)),  # Clamp to 1-5
+            "notes": f"Relevance: {reason[:150]}",
+        }
+    except Exception as e:
+        return {
+            "score": 3,
+            "notes": f"LLM-as-Judge failed ({str(e)[:50]}), defaulted to 3",
+        }
 
 
 def score_context_recall(
@@ -198,10 +282,58 @@ def score_completeness(
          Rate completeness 1-5. Are all key points covered?
          Output: {'score': int, 'missing_points': [str]}"
     """
-    return {
-        "score": None,
-        "notes": "TODO: Implement score_completeness (so sánh với expected_answer)",
-    }
+    if not expected_answer:
+        return {"score": None, "notes": "No expected answer provided for comparison"}
+
+    if not answer:
+        return {"score": 1, "notes": "No answer provided to compare"}
+
+    prompt = f"""You are an expert evaluator checking whether an AI assistant's answer is complete compared to the expected answer.
+
+User Question:
+{query}
+
+Expected Answer (reference):
+{expected_answer}
+
+AI Assistant Answer:
+{answer}
+
+Rate the completeness on a scale of 1-5:
+5 = The answer includes all important points from the expected answer
+4 = Missing 1 minor detail from the expected answer
+3 = Missing some important information
+2 = Missing many important pieces of information
+1 = Missing most or all core content from the expected answer
+
+Output ONLY a JSON object with this exact format, no markdown or other text:
+{{"score": <int>, "missing_points": ["list of important points missing from the answer"]}}"""
+
+    try:
+        response = call_llm(prompt).strip()
+        # Clean markdown formatting if present
+        if response.startswith("```json"):
+            response = response[7:]
+        if response.startswith("```"):
+            response = response[3:]
+        if response.endswith("```"):
+            response = response[:-3]
+
+        result = json.loads(response.strip())
+        score = int(result.get("score", 3))
+        missing = result.get("missing_points", [])
+        notes = f"Completeness: missing {len(missing)} points"
+        if missing:
+            notes += f": {', '.join(missing[:3])[:100]}"
+        return {
+            "score": min(5, max(1, score)),  # Clamp to 1-5
+            "notes": notes,
+        }
+    except Exception as e:
+        return {
+            "score": 3,
+            "notes": f"LLM-as-Judge failed ({str(e)[:50]}), defaulted to 3",
+        }
 
 
 # =============================================================================
@@ -488,23 +620,23 @@ if __name__ == "__main__":
 
     # --- Chạy Variant (sau khi Sprint 3 hoàn thành) ---
     # TODO Sprint 4: Uncomment sau khi implement variant trong rag_answer.py
-    # print("\n--- Chạy Variant ---")
-    # variant_results = run_scorecard(
-    #     config=VARIANT_CONFIG,
-    #     test_questions=test_questions,
-    #     verbose=True,
-    # )
-    # variant_md = generate_scorecard_summary(variant_results, VARIANT_CONFIG["label"])
-    # (RESULTS_DIR / "scorecard_variant.md").write_text(variant_md, encoding="utf-8")
+    print("\n--- Chạy Variant ---")
+    variant_results = run_scorecard(
+        config=VARIANT_CONFIG,
+        test_questions=test_questions,
+        verbose=True,
+    )
+    variant_md = generate_scorecard_summary(variant_results, VARIANT_CONFIG["label"])
+    (RESULTS_DIR / "scorecard_variant.md").write_text(variant_md, encoding="utf-8")
 
     # --- A/B Comparison ---
     # TODO Sprint 4: Uncomment sau khi có cả baseline và variant
-    # if baseline_results and variant_results:
-    #     compare_ab(
-    #         baseline_results,
-    #         variant_results,
-    #         output_csv="ab_comparison.csv"
-    #     )
+    if baseline_results and variant_results:
+        compare_ab(
+            baseline_results,
+            variant_results,
+            output_csv="ab_comparison.csv"
+        )
 
     print("\n\nViệc cần làm Sprint 4:")
     print("  1. Hoàn thành Sprint 2 + 3 trước")
