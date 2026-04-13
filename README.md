@@ -77,6 +77,17 @@ cp .env.example .env
 python index.py    # Xem preview preprocess + chunking (không cần API key)
 ```
 
+### 4. Chạy giao diện demo
+```bash
+streamlit run demo_app.py
+```
+
+Giao diện demo gồm 4 tab:
+- `Live QA`: hỏi đáp trực tiếp với pipeline RAG, xem answer, sources và retrieved chunks
+- `Evaluation`: chạy nhanh scorecard trên bộ test questions với baseline, variant hoặc config tùy chỉnh
+- `Existing Results`: xem lại kết quả baseline vs variant đã lưu trong `results/ab_comparison.csv`
+- `Corpus`: xem nhanh số tài liệu, metadata và số chunk đã index
+
 ---
 
 ## 4 Sprints
