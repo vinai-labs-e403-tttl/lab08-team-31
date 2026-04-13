@@ -239,6 +239,47 @@ def transform_query(query: str, strategy: str = "expansion") -> List[str]:
     """
     # TODO Sprint 3: Implement query transformation
     # Tạm thời trả về query gốc
+    import json
+    
+    if strategy == "expansion":
+        prompt = f"""Given the query: '{query}'
+Generate 2-3 alternative phrasings or related terms in Vietnamese to help with semantic search retrieval.
+Output ONLY a JSON array of strings, strictly with no markdown formatting or other text."""
+    elif strategy == "decomposition":
+        prompt = f"""Break down this complex query into 2 simpler sub-queries in Vietnamese: '{query}'
+Output ONLY a JSON array of strings, strictly with no markdown formatting or other text."""
+    elif strategy == "hyde":
+        prompt = f"""Write a hypothetical short paragraph (2-3 sentences) that directly answers this query in Vietnamese: '{query}'
+This snippet will be used for Dense similarity search, so simulate the language and keywords typical of formal internal company policy documents.
+Output ONLY a JSON array containing exactly one single string (the paragraph), with no markdown."""
+    else:
+        return [query]
+
+    try:
+        # Gọi hàm LLM đã config ở dưới
+        response = call_llm(prompt).strip()
+        
+        # Tiền xử lý xóa markdown code block nếu LLM lỡ sinh ra
+        if response.startswith("```json"):
+            response = response[7:]
+        elif response.startswith("```"):
+            response = response[3:]
+        if response.endswith("```"):
+            response = response[:-3]
+            
+        transformed_list = json.loads(response.strip())
+        
+        if isinstance(transformed_list, list) and len(transformed_list) > 0:
+            if strategy in ["expansion", "decomposition"]:
+                # Giữ cả câu hỏi gốc và kết hợp với mảng mở rộng
+                return [query] + transformed_list
+            return transformed_list  # Cho HyDE, mảng vốn chỉ có 1 tài liệu giả lập
+            
+    except NotImplementedError:
+        print("[transform_query] Cảnh báo: Hàm call_llm() chưa được cài đặt. Fallback về query gốc.")
+    except Exception as e:
+        print(f"[transform_query] Lỗi parsing hay LLM call: {e}. Fallback về query gốc.")
+        
     return [query]
 
 
@@ -261,12 +302,21 @@ def build_context_block(chunks: List[Dict[str, Any]]) -> str:
         score = chunk.get("score", 0)
         text = chunk.get("text", "")
 
-        # TODO: Tùy chỉnh format nếu muốn (thêm effective_date, department, ...)
-        header = f"[{i}] {source}"
-        if section:
-            header += f" | {section}"
-        if score > 0:
-            header += f" | score={score:.2f}"
+        # Trích xuất thêm các metadata quan trọng đã làm ở Sprint 1
+        department = meta.get("department", "")
+        effective_date = meta.get("effective_date", "")
+
+        header = f"[{i}] Root: {source}"
+        
+        # Gắn chuỗi thông tin phụ trợ bổ sung
+        extras = []
+        if section: extras.append(f"Section: {section}")
+        if department: extras.append(f"Dept: {department}")
+        if effective_date: extras.append(f"Date: {effective_date}")
+        if score > 0: extras.append(f"Score: {score:.2f}")
+
+        if extras:
+            header += " | " + " - ".join(extras)
 
         context_parts.append(f"{header}\n{text}")
 
@@ -287,18 +337,22 @@ def build_grounded_prompt(query: str, context_block: str) -> str:
     - Thêm ngôn ngữ phản hồi (tiếng Việt vs tiếng Anh)
     - Điều chỉnh tone phù hợp với use case (CS helpdesk, IT support)
     """
-    prompt = f"""Answer only from the retrieved context below.
-If the context is insufficient to answer the question, say you do not know and do not make up information.
-Cite the source field (in brackets like [1]) when possible.
-Keep your answer short, clear, and factual.
-Respond in the same language as the question.
+    prompt = f"""You are a professional and helpful AI Assistant for the Internal CS & IT Helpdesk.
+Your task is to answer the user's question based strictly on the retrieved context below.
 
-Question: {query}
+CRITICAL RULES:
+1. Evidence-only: Answer ONLY using the provided context. Do NOT use outside knowledge.
+2. Abstain: If the context does not contain sufficient information to answer the question, firmly say "Xin lỗi, tôi không có đủ dữ liệu hiện tại để trả lời câu hỏi này." and stop. Do not make up information.
+3. Citation: You MUST cite your sources using the bracket format (e.g., [1], [2]) at the end of the relevant facts or sentences.
+4. Format: Present your answer clearly. Use bullet points or numbered lists if explaining a multi-step process or multiple conditions.
+5. Tone & Language: Your tone should be polite, professional, and helpful. Always respond in Vietnamese (unless the user explicitly inputs a different language).
 
-Context:
+User Question: {query}
+
+Retrieved Context:
 {context_block}
 
-Answer:"""
+Final Answer:"""
     return prompt
 
 
@@ -329,10 +383,43 @@ def call_llm(prompt: str) -> str:
 
     Lưu ý: Dùng temperature=0 hoặc thấp để output ổn định cho evaluation.
     """
-    raise NotImplementedError(
-        "TODO Sprint 2: Implement call_llm().\n"
-        "Chọn Option A (OpenAI) hoặc Option B (Gemini) trong TODO comment."
-    )
+    api_key_openai = os.getenv("OPENAI_API_KEY")
+    api_key_gemini = os.getenv("GOOGLE_API_KEY")
+
+    if api_key_openai:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key_openai)
+            response = client.chat.completions.create(
+                model=LLM_MODEL,  # Ví dụ: gpt-4o-mini hoặc gpt-4o
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,    # 0 để RAG trả lời nghiêm túc, không chế chữ
+                max_tokens=600,
+            )
+            return response.choices[0].message.content
+        except ImportError:
+            raise ImportError("Vui lòng cài đặt OpenAI bằng lệnh: pip install openai")
+            
+    elif api_key_gemini:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=api_key_gemini)
+            
+            # Cấu hình tự động chuyển model gpt sang gemini nếu đang dùng biến môi trường mặc định
+            model_name = "gemini-1.5-flash" if "gpt" in LLM_MODEL else LLM_MODEL
+            model = genai.GenerativeModel(model_name)
+            
+            # Khởi tạo thông số chuẩn xác GenerationConfig để set temperature cho gemini
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(temperature=0.0)
+            )
+            return response.text
+        except ImportError:
+            raise ImportError("Vui lòng cài đặt Gemini bằng lệnh: pip install google-generativeai")
+            
+    else:
+        raise ValueError("[LỖI] Không tìm thấy OPENAI_API_KEY hoặc GOOGLE_API_KEY trong file .env. Vui lòng thiết lập để kết nối với bộ não LLM!")
 
 
 def rag_answer(
